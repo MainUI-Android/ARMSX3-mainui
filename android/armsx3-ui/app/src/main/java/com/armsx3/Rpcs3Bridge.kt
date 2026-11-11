@@ -297,6 +297,8 @@ object Rpcs3Bridge {
 
     @JvmStatic
     fun boot(path: String): Boolean {
+        // MainUI State API: a game is starting, MainUI's commands go to it from now on.
+        io.github.mainui.stateapi.MainUIStateApi.attach(io.github.mainui.stateapi.Armsx3States)
         // A game in a folder the user picked is recorded by document URI, because that is what
         // the library can read its cover and its SFO through. The core opens paths, so this is
         // where the two meet: the URI becomes a path under the SAF device, which resolves back

@@ -29,13 +29,15 @@ android {
 
     defaultConfig {
         applicationId = "com.armsx3"
+        // MainUI-Android build: installs beside the official app (CI sets the version).
+        applicationIdSuffix = ".mainui"
         // Set per variant by android/build-variants.sh: 33 for the A13 build (NDK 28), 35 for
         // the A15 build (NDK 29). The core is compiled against the matching API, so these must
         // agree -- an APK that installs below its core's target is a dlopen failure at boot.
         minSdk = (project.findProperty("armsx3.minSdk") as String?)?.toInt() ?: 33
         targetSdk = 37
-        versionCode = 114
-        versionName = "1.6.7"
+        versionCode = System.getenv("MAINUI_VERSION_CODE")?.toIntOrNull() ?: 114
+        versionName = System.getenv("MAINUI_VERSION_NAME") ?: "1.6.7"
 
         // ARMSX2's UI reads these. STORAGE_ALL_FILES gates the all-files storage path in
         // onboarding; IN_APP_UPDATER gates the in-app GitHub-release updater.
