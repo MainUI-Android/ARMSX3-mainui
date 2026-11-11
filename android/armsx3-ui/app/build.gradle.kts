@@ -49,7 +49,8 @@ android {
         // permissions have moved into the github flavor's manifest, so the play bundle does not
         // declare them at all.
         buildConfigField("boolean", "STORAGE_ALL_FILES", "true")
-        buildConfigField("boolean", "IN_APP_UPDATER", "true")
+        // (MainUI-Android build: off, MainUI updates it from MainUI-Android's releases.)
+        buildConfigField("boolean", "IN_APP_UPDATER", "false")
         buildConfigField("boolean", "FRAME_GENERATION", "true")
 
         // The URI scheme Discord sign-in returns through. github keeps the SDK's default,
