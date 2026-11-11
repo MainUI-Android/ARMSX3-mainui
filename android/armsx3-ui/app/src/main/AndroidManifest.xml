@@ -110,6 +110,17 @@
              big cores and peak clocks instead of throttling as a normal app. -->
         <meta-data android:name="android.app.game_mode" android:value="performance" />
 
+        <!-- MainUI State API: MainUI (a frontend) saves and loads states with broadcasts. -->
+        <meta-data android:name="io.github.mainui.STATE_API" android:value="1" />
+        <receiver
+            android:name="io.github.mainui.stateapi.MainUIStateApi$Receiver"
+            android:exported="true"
+            tools:ignore="ExportedReceiver">
+            <intent-filter>
+                <action android:name="io.github.mainui.stateapi.COMMAND" />
+            </intent-filter>
+        </receiver>
+
         <!-- Profileable from the adb shell. Lets simpleperf record from the
              release build without flipping debuggable on (which would also
              change the JIT path and skew the numbers). -->
