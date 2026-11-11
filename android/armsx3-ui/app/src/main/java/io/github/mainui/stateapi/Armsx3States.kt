@@ -27,6 +27,13 @@ object Armsx3States : MainUIStateApi.Emulator {
 
     override fun slotCount() = SLOTS
 
+    override fun pause(): Boolean {
+        Rpcs3Bridge.pause()
+        return true
+    }
+
+    override fun resume() = Rpcs3Bridge.resume()
+
     override fun save(slot: Int): String {
         val i = index(slot)
         val before = Rpcs3Bridge.slotSavedAt(i)
