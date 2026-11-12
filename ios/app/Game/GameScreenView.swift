@@ -310,7 +310,14 @@ struct GameScreenView: View {
             }
             // The RPCN status every 2 s while the game runs. .task ends it when the screen goes.
             .task { await pollRpcn() }
+            // A full phone ends the game without a word, so the banner comes first and repeats while space stays low.
+            .task { await watchStorage() }
+            // A controller does not reset the idle timer, so the phone would lock mid-game.
+            .onChange(of: bootStatus == 0 && !stopping && !menuOpen && scenePhase == .active, initial: true) { _, awake in
+                UIApplication.shared.isIdleTimerDisabled = awake
+            }
             .onDisappear {
+                UIApplication.shared.isIdleTimerDisabled = false
                 // The screen closing finishes a running recording's file.
                 stopRecordingAutomatically()
                 GamepadPoller.shared.stop()
@@ -596,6 +603,26 @@ struct GameScreenView: View {
         guard rpcnBackgroundTask != .invalid else { return }
         UIApplication.shared.endBackgroundTask(rpcnBackgroundTask)
         rpcnBackgroundTask = .invalid
+    }
+
+    private func watchStorage() async {
+        let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let repeatEvery = 6
+        var sinceWarned = repeatEvery
+        while !Task.isCancelled {
+            if bootStatus == 0, !stopping, StorageWatch.isLow(StorageWatch.availableBytes(at: documents)) {
+                sinceWarned += 1
+                if sinceWarned >= repeatEvery {
+                    sinceWarned = 0
+                    let text = String(localized: "Storage is almost full. Free some space or the game may close.")
+                    shotBanner.present(text, displayDuration: 6)
+                    AccessibilityNotification.Announcement(text).post()
+                }
+            } else {
+                sinceWarned = repeatEvery
+            }
+            try? await Task.sleep(for: .seconds(10))
+        }
     }
 
     private func pollRpcn() async {
