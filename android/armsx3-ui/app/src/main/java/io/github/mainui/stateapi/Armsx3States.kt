@@ -27,12 +27,21 @@ object Armsx3States : MainUIStateApi.Emulator {
 
     override fun slotCount() = SLOTS
 
+    /** MainUI's pause took effect (not one the user or ARMSX3's overlay holds). */
+    @Volatile private var pausedByMainUi = false
+
     override fun pause(): Boolean {
+        if (Rpcs3Bridge.isPaused()) return true
         Rpcs3Bridge.pause()
+        pausedByMainUi = true
         return true
     }
 
-    override fun resume() = Rpcs3Bridge.resume()
+    override fun resume() {
+        if (!pausedByMainUi) return
+        pausedByMainUi = false
+        Rpcs3Bridge.resume()
+    }
 
     override fun save(slot: Int): String {
         val i = index(slot)
