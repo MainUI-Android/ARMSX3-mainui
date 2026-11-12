@@ -1,5 +1,6 @@
 package io.github.mainui.stateapi
 
+import com.armsx2.ui.WindowImpl
 import com.armsx3.Rpcs3Bridge
 import com.armsx3.core.ARMSX3
 import com.armsx3.core.EmulatorState
@@ -23,7 +24,14 @@ object Armsx3States : MainUIStateApi.Emulator {
         state().let { it == EmulatorState.Running || it == EmulatorState.Paused } && Rpcs3Bridge.getTitleId().isNotEmpty()
 
     override fun isReady(): Boolean =
-        state() == EmulatorState.Running && !Rpcs3Bridge.isPaused() && Rpcs3Bridge.getTitleId().isNotEmpty()
+        state() == EmulatorState.Running && !pausedByMainUi && !ownPause() && Rpcs3Bridge.getTitleId().isNotEmpty()
+
+    /**
+     * ARMSX3 holds its own pause, shown by its overlay or a screen over the game. (Rpcs3Bridge's
+     * flag alone can be left over from the previous game: a new boot doesn't clear it.)
+     */
+    private fun ownPause(): Boolean =
+        Rpcs3Bridge.isPaused() && (WindowImpl.overlayVisible.value || WindowImpl.inGameScreen.value != null)
 
     override fun slotCount() = SLOTS
 
@@ -31,7 +39,8 @@ object Armsx3States : MainUIStateApi.Emulator {
     @Volatile private var pausedByMainUi = false
 
     override fun pause(): Boolean {
-        if (Rpcs3Bridge.isPaused()) return true
+        // (Again while MainUI holds it: a save restarts the game, running.)
+        if (!pausedByMainUi && ownPause()) return true
         Rpcs3Bridge.pause()
         pausedByMainUi = true
         return true
@@ -42,6 +51,14 @@ object Armsx3States : MainUIStateApi.Emulator {
         pausedByMainUi = false
         Rpcs3Bridge.resume()
     }
+
+    override fun liftOwnPause(): Boolean {
+        if (pausedByMainUi || !ownPause()) return false
+        Rpcs3Bridge.resume()
+        return true
+    }
+
+    override fun restoreOwnPause() = Rpcs3Bridge.pause()
 
     override fun save(slot: Int): String {
         val i = index(slot)
