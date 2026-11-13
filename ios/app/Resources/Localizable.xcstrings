@@ -8627,6 +8627,16 @@
         }
       }
     },
+    "Report" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Report"
+          }
+        }
+      }
+    },
     "Report a Problem" : {
       "localizations" : {
         "en" : {
@@ -11731,6 +11741,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "This LiveContainer is %@, and built-in JIT needs 3.8.13 or later, so StikDebug turned on JIT instead. Update LiveContainer, then install ARMSX3 in it again."
+          }
+        }
+      }
+    },
+    "This LiveContainer is %@, and built-in JIT needs 3.8.13 or later. Update LiveContainer, then install ARMSX3 in it again." : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "This LiveContainer is %@, and built-in JIT needs 3.8.13 or later. Update LiveContainer, then install ARMSX3 in it again."
           }
         }
       }
