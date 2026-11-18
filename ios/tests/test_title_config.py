@@ -64,7 +64,13 @@ KOTLIN_CONFIG_DB = ROOT / "android" / "armsx3-ui" / "app" / "src" / "main" / "ja
 KILLZONE = "BCUS98234"
 
 IOS_ONLY_REQUIRED = ("NPUB30558", "BLUS30837", "BLES01613", "BLUS30405", "BLES00713",
-                     "BLES00714", "BLES00158", "BLUS30089", "BLUS30065", "BLES00142")
+                     "BLES00714", "BLES00158", "BLUS30089", "BLUS30065", "BLES00142",
+                     "BLES01717", "BCUS98111", "BCES00510", "BCES00799", "BCAS25003", "BCKS15003", "BCJS37001",
+                     "NPUA70080")
+
+GOD_OF_WAR_3 = ("BCUS98111", "BCES00510", "BCES00799", "BCAS25003", "BCKS15003", "BCJS37001", "NPUA70080")
+
+IOS_ONLY_APPROXIMATE_XFLOAT = "Core:\\n  SPU XFloat Accuracy: Approximate\\n"
 
 IOS_ONLY_NO_INTERPRETER = "Video:\\n  Shader Mode: Async Recompiler (multi-threaded)\\n"
 
@@ -78,13 +84,17 @@ IOS_ONLY_APPROXIMATE_ZCULL = "Video:\\n  Accurate ZCULL stats: false\\n  Relaxed
 
 IOS_ONLY_HIGH_PRECISION = "Video:\\n  Shader Precision: High\\n"
 
+IOS_ONLY_TWO_SPU_THREADS = "Core:\\n  Preferred SPU Threads: 2\\n"
+
 IOS_ONLY_ROWS = {
+    **{serial: IOS_ONLY_APPROXIMATE_XFLOAT for serial in GOD_OF_WAR_3},
     "NPUB30558": "Core:\\n  SPU loop detection: true\\n",
     "BLUS30837": IOS_ONLY_NO_INTERPRETER,
     "BLES01613": IOS_ONLY_NO_INTERPRETER,
     "BLUS30405": IOS_ONLY_SPU_COMPILE_PAUSE,
     "BLES00713": IOS_ONLY_DANTE_EU_PARK,
     "BLES00714": IOS_ONLY_SPU_COMPILE_PAUSE,
+    "BCUS98174": IOS_ONLY_SPU_COMPILE_PAUSE,
     "BLES00158": IOS_ONLY_APPROXIMATE_ZCULL,
     "BLUS30089": IOS_ONLY_APPROXIMATE_ZCULL,
     "BLUS30065": IOS_ONLY_HIGH_PRECISION,
@@ -106,6 +116,7 @@ IOS_ONLY_ROWS = {
     "NPUA80918": IOS_ONLY_STUB_TRAPS,
     "NPEA00445": IOS_ONLY_STUB_TRAPS,
     "NPHA80258": IOS_ONLY_STUB_TRAPS,
+    "BLES01717": IOS_ONLY_TWO_SPU_THREADS,
 }
 
 FIX_PATHS = ["Core@@PPU Decoder", "Video@@Frame limit", "Video@@Write Color Buffers"]
@@ -311,7 +322,7 @@ def ios_only_problems(header_text, kotlin_text, results):
             problems.append("iosonly: {0} has no expected row in the test".format(serial))
         elif config != want:
             problems.append("iosonly: {0} sets {1!r}, not exactly {2!r}".format(serial, config, want))
-        if serial in ported:
+        if serial in ported and serial not in GOD_OF_WAR_3:
             problems.append("iosonly: {0} is also in the ported table or Android's".format(serial))
         text = config.replace("\\n", "\n")
         known, added, got = results.get("^" + serial, (1, 0, ""))
@@ -333,6 +344,10 @@ def local_problems(header_text, kotlin_text, results):
     if not theirs or ours != theirs:
         problems.append("local: local_overrides ({0}) is not Android's LOCAL_OVERRIDES ({1})".format(len(ours), len(theirs)))
     for serial, config in theirs:
+        if serial in GOD_OF_WAR_3:
+            if serial not in dict(ours):
+                problems.append("local: {0} is not in local_overrides, which must stay Android's".format(serial))
+            continue
         text = config.replace("\\n", "\n")
         known, added, got = results.get("^" + serial, (1, 0, ""))
         leaves = len(re.findall(r"^\s+[^:\n]+: \S", text, re.M))
@@ -505,14 +520,20 @@ class Mutations(unittest.TestCase):
                         "const merged ours = merge(\"\", entry, accepts);\n\t\tmerged all = merge(ours.text, local_override_for(serial), accepts);")
         self.caught(behaviour_problems(h, self.product, self.kotlin), "local")
 
+    LOCAL_LOOP = "for (const local_override& o : local_overrides)\n\t\t{\n\t\t\tif (o.serial == serial)\n\t\t\t{\n\t\t\t\treturn o.config;"
+
     def test_local_table_not_consulted(self):
-        h = self.edited(self.header, "\t\t\t\treturn o.config;", "\t\t\t\treturn {};")
+        h = self.edited(self.header, self.LOCAL_LOOP, self.LOCAL_LOOP.replace("return o.config;", "return {};"))
         self.caught(behaviour_problems(h, self.product, self.kotlin), "local")
 
     IOS_ONLY_LOOP = "for (const local_override& o : ios_only_overrides)\n\t\t{\n\t\t\tif (o.serial == serial)\n\t\t\t{\n\t\t\t\treturn o.config;"
 
     def test_ios_only_table_not_consulted(self):
         h = self.edited(self.header, self.IOS_ONLY_LOOP, self.IOS_ONLY_LOOP.replace("return o.config;", "return {};"))
+        self.caught(behaviour_problems(h, self.product, self.kotlin), "iosonly")
+
+    def test_android_row_wins_over_the_ios_row(self):
+        h = self.edited(self.header, self.IOS_ONLY_LOOP, "for (const local_override& o : local_overrides)\n\t\t{\n\t\t\tif (o.serial == serial)\n\t\t\t{\n\t\t\t\treturn o.config;\n\t\t\t}\n\t\t}\n\t\t" + self.IOS_ONLY_LOOP)
         self.caught(behaviour_problems(h, self.product, self.kotlin), "iosonly")
 
     def test_ios_only_row_moved_into_the_ported_table(self):
@@ -555,6 +576,10 @@ class Mutations(unittest.TestCase):
 
     def test_simpsons_row_takes_the_database_precision(self):
         h = self.edited(self.header, '{"BLUS30065", "Video:\\n  Shader Precision: High', '{"BLUS30065", "Video:\\n  Shader Precision: Low')
+        self.caught(behaviour_problems(h, self.product, self.kotlin), "iosonly")
+
+    def test_black_ops_2_row_lets_every_spu_thread_run(self):
+        h = self.edited(self.header, '{"BLES01717", "Core:\\n  Preferred SPU Threads: 2', '{"BLES01717", "Core:\\n  Preferred SPU Threads: 0')
         self.caught(behaviour_problems(h, self.product, self.kotlin), "iosonly")
 
     def test_redirect_merge_turns_case_sensitive(self):
