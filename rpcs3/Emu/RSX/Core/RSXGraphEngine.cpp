@@ -21,6 +21,13 @@ namespace rsx
 		RSX_SHADER_CONTROL_PROGRAMMABLE_BLENDING |
 		RSX_SHADER_CONTROL_EMULATE_DEPTH_RANGE;
 
+	// Programmable blending was wanted for the last draw but left off because not every color target
+	// the fragment program exports was bound (graph_engine::get_fragment_program_export_config). Kept
+	// here rather than as a graph_engine member: RSXGraphEngine.h reaches the SPU compiler's units,
+	// which android/spu_codegen_identity.py hashes preprocessed, so a member there would throw away
+	// every player's compiled SPU code for an RSX change. One RSX thread drives the graph engine.
+	static bool s_programmable_blending_held = false;
+
 	static bool evaluate_programmable_blending_state(rsx::context* ctx, u32& fragment_ctrl)
 	{
 		const bool is_blend_config_dirty = ctx->graphics_state.test(rsx::blend_config_dirty);
@@ -937,9 +944,35 @@ namespace rsx
 		{
 			expected_ctrl = m_ctx->program.fragment_program.ctrl & RSX_SHADER_CONTROL_PROGRAMMABLE_BLENDING;
 
-			if (m_ctx->graphics_state.test(rsx::pipeline_config_dirty))
+			if (m_ctx->graphics_state.test(rsx::pipeline_config_dirty) || s_programmable_blending_held)
 			{
 				evaluate_programmable_blending_state(m_ctx, expected_ctrl);
+			}
+
+			// It reads back one input per color target the program exports, so all of them have to be
+			// bound. A draw can lose some or all of them and keep its depth buffer, which the check above
+			// does not cover: no color writes (Ashes Cricket 2009 masks every channel with an alpha blend
+			// still on, and the Vulkan backend stopped on its "mrt_buffers_count == m_draw_buffers.size()"
+			// check), a target that fails the pitch check, or one aliasing the depth buffer. Such a draw
+			// blends in fixed function, and the next draw evaluates the state again, so the setting comes
+			// back once the targets do (pipeline_config_dirty is cleared at the end of this draw).
+			s_programmable_blending_held = false;
+
+			if (expected_ctrl & RSX_SHADER_CONTROL_PROGRAMMABLE_BLENDING)
+			{
+				const auto& layout = m_ctx->fb.layout;
+				u32 bound = 0;
+
+				for (const u8 index : rsx::utility::get_rtt_indexes(layout.target))
+				{
+					bound += layout.color_addresses[index] != 0;
+				}
+
+				if (bound != rsx::utility::get_mrt_buffers_count(REGS(m_ctx)->surface_color_target()))
+				{
+					expected_ctrl &= ~RSX_SHADER_CONTROL_PROGRAMMABLE_BLENDING;
+					s_programmable_blending_held = true;
+				}
 			}
 		}
 
@@ -1213,6 +1246,13 @@ namespace rsx
 		switch (REGS(m_ctx)->surface_color())
 		{
 		case rsx::surface_color_format::w16z16y16x16:
+			if ((m_ctx->program.fragment_program.ctrl & CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS) &&
+				g_cfg.video.shader_precision != gpu_preset_level::low)
+			{
+				// F32 values need to be narrowed into RSX-compliant F16 storage (ROP stage)
+				m_ctx->program.fragment_program.ctrl |= RSX_SHADER_CONTROL_F16_FRAMEBUFFER;
+			}
+			break; // Technically fall through is also correct here
 		case rsx::surface_color_format::w32z32y32x32:
 		case rsx::surface_color_format::x32:
 			// These behave very differently from "normal" formats.

@@ -172,8 +172,23 @@ object ConfigDatabase {
         // Capping how many SPU threads run at once makes jobs run late, which is what exposes that
         // race. Back on 0 he got through, and the crash never appeared in 38 of our own runs at 0.
         // Pinned here, per title, so a global 3 cannot bring it back.
-        "BCUS98234" to "Video:\n  Write Color Buffers: false\nCore:\n  Preferred SPU Threads: 0\n",
-        "BCES01007" to "Video:\n  Write Color Buffers: false\nCore:\n  Preferred SPU Threads: 0\n",
+        //
+        // Fence Poll Completion Markers (Video/Vulkan; off elsewhere). On the Turnip build measured
+        // (Mesa 26.3.0-devel; Mesa main now polls) a zero-timeout fence poll waits for the fence
+        // instead of answering. With frame generation on, the RSX thread slept in the poll it makes
+        // after every flip until the GPU had finished the frame, while the game's next commands were
+        // already queued. With the markers, a poll of a command buffer the GPU has not reached
+        // answers "not yet" without asking the driver. Campaign, frame generation x2, off -> on:
+        // [to be measured on current master, alternated runs].
+        //
+        // SPU Inline Interrupt Idioms on (Core; off elsewhere). The game's SPU code wraps its DMA
+        // sequences in bid/bie, and without the setting the code after each one runs as a function
+        // of its own, reached through the dispatcher: in one of its SPU function lists, 4,206 of
+        // 10,264 functions begin right after one. Campaign, steady state, off -> on: [to be
+        // measured on current master, alternated runs]. The bie half needs SPU Block Size Mega,
+        // which RPCS3's database entry for the game sets. Both contributed by k1r4ct (issue #281).
+        "BCUS98234" to "Video:\n  Write Color Buffers: false\n  Vulkan:\n    Fence Poll Completion Markers: true\nCore:\n  Preferred SPU Threads: 0\n  SPU Inline Interrupt Idioms: true\n",
+        "BCES01007" to "Video:\n  Write Color Buffers: false\n  Vulkan:\n    Fence Poll Completion Markers: true\nCore:\n  Preferred SPU Threads: 0\n  SPU Inline Interrupt Idioms: true\n",
 
         // Spider-Man: Web of Shadows: Accurate SPU Reservations off.
         //
@@ -347,11 +362,16 @@ object ConfigDatabase {
         // With vertex fetch specialization on, it took the robots fight from 21.9 to 25.7 FPS
         // (Retroid Pocket 6, Turnip, 11-06); alone it gains nothing there.
         // Contributed by k1r4ct (PR #232, PR #233).
-        "BCES00052" to "Core:\n  Thread Scheduler Mode: RPCS3 Scheduler\n  SPU GETLLAR Busy Waiting Percentage: 0\nVideo:\n  Vulkan:\n    Vertex Fetch Specialization: true\n    Early Submit Draw Threshold: 1024\n",
-        "BCUS98127" to "Core:\n  Thread Scheduler Mode: RPCS3 Scheduler\n  SPU GETLLAR Busy Waiting Percentage: 0\nVideo:\n  Vulkan:\n    Vertex Fetch Specialization: true\n    Early Submit Draw Threshold: 1024\n",
-        "BCJS30014" to "Core:\n  Thread Scheduler Mode: RPCS3 Scheduler\n  SPU GETLLAR Busy Waiting Percentage: 0\nVideo:\n  Vulkan:\n    Vertex Fetch Specialization: true\n    Early Submit Draw Threshold: 1024\n",
-        "NPEA00452" to "Core:\n  Thread Scheduler Mode: RPCS3 Scheduler\n  SPU GETLLAR Busy Waiting Percentage: 0\nVideo:\n  Vulkan:\n    Vertex Fetch Specialization: true\n    Early Submit Draw Threshold: 1024\n",
-        "NPUA80965" to "Core:\n  Thread Scheduler Mode: RPCS3 Scheduler\n  SPU GETLLAR Busy Waiting Percentage: 0\nVideo:\n  Vulkan:\n    Vertex Fetch Specialization: true\n    Early Submit Draw Threshold: 1024\n",
+        //
+        // ToD also gets Fence Poll Completion Markers (Video/Vulkan; off elsewhere), for the reason
+        // given at Killzone 3 above. On that Turnip build the poll of early submit waited for the
+        // previous submit as well, instead of telling whether the GPU had finished it. Robots fight,
+        // off -> on: [to be measured on current master, alternated runs]. Contributed by k1r4ct (issue #281).
+        "BCES00052" to "Core:\n  Thread Scheduler Mode: RPCS3 Scheduler\n  SPU GETLLAR Busy Waiting Percentage: 0\nVideo:\n  Vulkan:\n    Vertex Fetch Specialization: true\n    Early Submit Draw Threshold: 1024\n    Fence Poll Completion Markers: true\n",
+        "BCUS98127" to "Core:\n  Thread Scheduler Mode: RPCS3 Scheduler\n  SPU GETLLAR Busy Waiting Percentage: 0\nVideo:\n  Vulkan:\n    Vertex Fetch Specialization: true\n    Early Submit Draw Threshold: 1024\n    Fence Poll Completion Markers: true\n",
+        "BCJS30014" to "Core:\n  Thread Scheduler Mode: RPCS3 Scheduler\n  SPU GETLLAR Busy Waiting Percentage: 0\nVideo:\n  Vulkan:\n    Vertex Fetch Specialization: true\n    Early Submit Draw Threshold: 1024\n    Fence Poll Completion Markers: true\n",
+        "NPEA00452" to "Core:\n  Thread Scheduler Mode: RPCS3 Scheduler\n  SPU GETLLAR Busy Waiting Percentage: 0\nVideo:\n  Vulkan:\n    Vertex Fetch Specialization: true\n    Early Submit Draw Threshold: 1024\n    Fence Poll Completion Markers: true\n",
+        "NPUA80965" to "Core:\n  Thread Scheduler Mode: RPCS3 Scheduler\n  SPU GETLLAR Busy Waiting Percentage: 0\nVideo:\n  Vulkan:\n    Vertex Fetch Specialization: true\n    Early Submit Draw Threshold: 1024\n    Fence Poll Completion Markers: true\n",
         "BCES00301" to "Core:\n  Thread Scheduler Mode: RPCS3 Scheduler\n  SPU GETLLAR Busy Waiting Percentage: 0\n",
         "BCAS20052" to "Core:\n  Thread Scheduler Mode: RPCS3 Scheduler\n  SPU GETLLAR Busy Waiting Percentage: 0\n",
         "NPEA00088" to "Core:\n  Thread Scheduler Mode: RPCS3 Scheduler\n  SPU GETLLAR Busy Waiting Percentage: 0\n",
@@ -363,6 +383,43 @@ object ConfigDatabase {
         "BCUS99245" to "Core:\n  Thread Scheduler Mode: RPCS3 Scheduler\n  SPU GETLLAR Busy Waiting Percentage: 0\n",
         "NPEA00457" to "Core:\n  Thread Scheduler Mode: RPCS3 Scheduler\n  SPU GETLLAR Busy Waiting Percentage: 0\n",
         "NPUA80908" to "Core:\n  Thread Scheduler Mode: RPCS3 Scheduler\n  SPU GETLLAR Busy Waiting Percentage: 0\n",
+
+        // The Last of Us: Stub PPU Traps at 1 and SPU Cache off; Pause Game During SPU Compilation off.
+        //
+        // Its loading screen reaches thousands of SPU functions the first time. When each one compiled
+        // on the spot, its SPU stalled while the game kept waiting on it, and both failures on the Odin 3
+        // (11-09) came in such a burst. First boot, about 1,650 compiled in the 25 s before: a SPURS
+        // job wrote to address 0 and the main and sound threads crashed on overwritten pointers. Next
+        // boot, about 2,600 in 20 s: the main thread's countdown at 0x990abc (01.11) ran out and hit
+        // the game's assert trap. Pause Game During SPU Compilation held the whole game for every
+        // compile (11-09 to 11-10), which stopped both but froze the picture for seconds at a time.
+        // Since 11-10 new SPU code compiles in the background and runs in the interpreter meanwhile,
+        // which only works with the pause off, so it is written off here: "false" also outvotes the
+        // "true" an earlier build appended to this title's file, as the last occurrence wins. Stub
+        // Traps 1 is RPCS3's own answer to that assert on ARM (its wiki, for macOS): if a wait runs out
+        // anyway the game carries on, and the log says "PPU Trap: Stubbing".
+        //
+        // SPU Cache off, as for Blades of Time: every boot that built the saved SPU list first (14,116
+        // functions) stalled on a loading screen, file reads stopped, the SPUs idle and the main
+        // thread spinning, while boots that compiled as the game ran loaded through every time (Odin
+        // 3, 11-10, four boots each way, with and without the pause). Compiled code still comes from
+        // the SPU object cache as each function is first run, so later boots do not compile again.
+        "BCUS98174" to "Core:\n  Pause Game During SPU Compilation: false\n  Stub PPU Traps: 1\n  SPU Cache: false\n",
+        "BCES01584" to "Core:\n  Pause Game During SPU Compilation: false\n  Stub PPU Traps: 1\n  SPU Cache: false\n",
+        "BCES01585" to "Core:\n  Pause Game During SPU Compilation: false\n  Stub PPU Traps: 1\n  SPU Cache: false\n",
+        "BCJS37010" to "Core:\n  Pause Game During SPU Compilation: false\n  Stub PPU Traps: 1\n  SPU Cache: false\n",
+        "BCAS20270" to "Core:\n  Pause Game During SPU Compilation: false\n  Stub PPU Traps: 1\n  SPU Cache: false\n",
+        "NPUA80960" to "Core:\n  Pause Game During SPU Compilation: false\n  Stub PPU Traps: 1\n  SPU Cache: false\n",
+        "NPEA00435" to "Core:\n  Pause Game During SPU Compilation: false\n  Stub PPU Traps: 1\n  SPU Cache: false\n",
+        "NPHA80243" to "Core:\n  Pause Game During SPU Compilation: false\n  Stub PPU Traps: 1\n  SPU Cache: false\n",
+        "NPJA00096" to "Core:\n  Pause Game During SPU Compilation: false\n  Stub PPU Traps: 1\n  SPU Cache: false\n",
+
+        // Blur: background SPU compiling, like every other title. Its splash video went black with it
+        // on (11-10) and played with the pause on instead (a test build), which pointed at the
+        // interpreter that runs new code meanwhile: it ignored SPU XFloat Accuracy (Blur runs Accurate)
+        // and its FI was off by a factor of two below 1.0. Both now match the compiled code. "false"
+        // outvotes the "true" that test build appended to this title's file, as the last occurrence wins.
+        "BLUS30295" to "Core:\n  Pause Game During SPU Compilation: false\n",
     )
 
     /**
@@ -380,10 +437,15 @@ object ConfigDatabase {
             runCatching {
                 val file = File(dir, "$serial.yml")
                 val existing = if (file.isFile) file.readText() else ""
-                // Already applied. Checking for the override itself rather than for the setting's
-                // name, which skipped an override whenever the database set the same key, the one
-                // case it exists for.
-                if (existing.contains(yaml.trimEnd())) return@runCatching
+                // Already applied when every setting it makes is the one in effect, i.e. the last
+                // occurrence of its key, which is how the core reads the file. Looking for the
+                // override's own text instead missed a value switched BACK: The Last of Us went
+                // pause off, then a test build appended pause on, then pause off again, and the
+                // third block was already in the file above the second, so it was never appended
+                // and the test build's value stayed in effect. Per-game choices are not in this
+                // file (see writeUserKeys), so writing a value again overrides nothing of the user's.
+                val effective = parseEntries(existing.lineSequence())
+                if (parseEntries(yaml.lineSequence()).all { (key, value) -> effective[key] == value }) return@runCatching
                 file.writeText(if (existing.isBlank()) yaml else existing.trimEnd() + "\n" + yaml)
             }
         }
@@ -418,29 +480,57 @@ object ConfigDatabase {
         val file = File(directory(), "$title.yml")
         if (!file.isFile) return emptyList()
 
+        return runCatching { parseEntries(file.readLines().asSequence()).toList() }.getOrDefault(emptyList())
+    }
+
+    /**
+     * "Section@@Key" to value for YAML in this file's shape, in file order, the last
+     * occurrence of a key winning as it does in the core. Two spaces per level.
+     */
+    private fun parseEntries(lines: Sequence<String>): LinkedHashMap<String, String> {
         val out = LinkedHashMap<String, String>()
         val path = ArrayList<String>()
 
-        runCatching {
-            for (raw in file.readLines()) {
-                val line = raw.trimEnd()
-                val first = line.indexOfFirst { it != ' ' }
-                if (first < 0 || line[first] == '#') continue
-                val colon = line.indexOf(':', first)
-                if (colon < 0) continue
+        for (raw in lines) {
+            val line = raw.trimEnd()
+            val first = line.indexOfFirst { it != ' ' }
+            if (first < 0 || line[first] == '#') continue
+            val colon = line.indexOf(':', first)
+            if (colon < 0) continue
 
-                val indent = first / 2
-                while (path.size > indent) path.removeAt(path.size - 1)
-                path.add(line.substring(first, colon).trim())
+            val indent = first / 2
+            while (path.size > indent) path.removeAt(path.size - 1)
+            path.add(line.substring(first, colon).trim())
 
-                val value = line.substring(colon + 1).trim()
-                // A header opens a section instead of setting anything.
-                if (value.isNotEmpty()) out[path.joinToString("@@")] = value
-            }
+            val value = line.substring(colon + 1).trim()
+            // A header opens a section instead of setting anything.
+            if (value.isNotEmpty()) out[path.joinToString("@@")] = value
         }
 
-        return out.toList()
+        return out
     }
+
+    /**
+     * The database keys this title's own configuration owns: the core edits made for it in All
+     * Core Settings and, while a Display FPS Cap is set, the two frame-limit nodes that row writes.
+     *
+     * A cap is the user's choice like any core edit, so the database must not land a different
+     * limit over it at boot. Sly Cooper: Thieves in Time's entry sets Frame limit 60, and a 30 cap
+     * read 60 on every launch until the row was touched in game (issue #278). "Off" sets no cap of
+     * ARMSX3's own, so there the database's limit still applies.
+     *
+     * [fpsLimit] is the cap being applied when the caller has it (the boot push); otherwise this
+     * title's resolved settings are read.
+     */
+    fun ownedKeys(settingsKey: String?, fpsLimit: Int? = null): Set<String> {
+        val title = settingsKey?.trim().orEmpty()
+        if (title.isEmpty()) return emptySet()
+        val edits = runCatching { CoreSettingOverrides.load(SettingsScope.Game, title).keys }.getOrDefault(emptySet())
+        val cap = fpsLimit ?: runCatching { ConfigStore.resolveForGame(title).fpsLimit }.getOrDefault(0)
+        return if (cap != 0) edits + FRAME_LIMIT_KEYS else edits
+    }
+
+    private val FRAME_LIMIT_KEYS = setOf("Video@@Frame limit", "Video@@Second Frame Limit")
 
     /** Keys of a title's database entry the user switched off. */
     fun ignoredFor(serial: String?): Set<String> {

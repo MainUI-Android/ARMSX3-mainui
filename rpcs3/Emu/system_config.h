@@ -46,6 +46,13 @@ struct cfg_root : cfg::node
 #endif
 		cfg::_int<1, 6> max_spurs_threads{ this, "Max SPURS Threads", 6, true }; // HACK. If less then 6, max number of running SPURS threads in each thread group.
 		cfg::_enum<spu_block_size_type> spu_block_size{ this, "SPU Block Size", spu_block_size_type::safe };
+#ifdef __ANDROID__
+		// ARMSX3: SPU LLVM compiles the interrupt toggle idioms (a bid or bie to the next instruction)
+		// in line instead of leaving the compiled function at each one; bie with SPU Block Size Mega
+		// only. Part of the SPU object cache key and of the SPU cache file name, so not dynamic. Off
+		// by default; the config database turns it on per title. Contributed by k1r4ct (issue #281).
+		cfg::_bool spu_inline_interrupt_idioms{ this, "SPU Inline Interrupt Idioms", false };
+#endif
 		cfg::_bool spu_accurate_dma{ this, "Accurate SPU DMA", false };
 		cfg::_bool spu_accurate_reservations{ this, "Accurate SPU Reservations", true };
 		cfg::_bool spu_mmio_delay_enabled{ this, "SPU MMIO Delay Enabled", false, true};
@@ -292,6 +299,12 @@ struct cfg_root : cfg::node
 			// and the GPU has finished the previous submit, submit it early instead of leaving the GPU
 			// idle until the next flush point. Values 1-255 count as 256. Read when the renderer starts.
 			cfg::uint<0, 65535> early_submit_draw_threshold{ this, "Early Submit Draw Threshold", 0 };
+			// ARMSX3: off by default; the config database turns it on per title. Read when the renderer
+			// starts. The last command of every primary command buffer a fence poll can ask about (not
+			// those submitted with the caller's own fence) writes a number to mapped memory, and a poll
+			// answers "not yet" from that word, without asking the driver, while the GPU has not reached
+			// it (VKGSRender::arm_completion_marker). Contributed by k1r4ct (issue #281).
+			cfg::_bool fence_poll_completion_markers{ this, "Fence Poll Completion Markers", false };
 #ifdef __ANDROID__
 			// ARMSX3: left on. Android has no Re-BAR; the name only fits desktop cards. RPCS3 counts any
 			// device-local, host-visible, coherent memory type as "BAR", and on a phone that is plain

@@ -2,6 +2,10 @@
 #include <charconv>
 #include "SPURecompiler.h"
 
+// On Android the persistent SPU object cache is keyed on this file as the compiler sees it, along
+// with the other code that decides what SPU machine code comes out (android/spu_codegen_identity.py).
+// Code elsewhere that this starts running or copying while it compiles goes in that script's lists.
+
 #include "Emu/System.h"
 #include "Emu/system_config.h"
 #include "Emu/IdManager.h"
@@ -18,6 +22,7 @@ bool spu_is_killzone3(); // SPUThread.cpp
 #include "SPUThread.h"
 #include "SPUAnalyser.h"
 #include "SPUInterpreter.h"
+#include "SPUNativePrograms.h"
 #include <algorithm>
 #include <thread>
 
@@ -253,6 +258,9 @@ class spu_llvm_recompiler : public spu_recompiler_base, public cpu_translator
 
 	// Module name
 	std::string m_hash;
+
+	// ARMSX3: the program being compiled runs a native version when it can (SPUNativePrograms.h)
+	bool m_hooked = false;
 
 #ifdef __APPLE__
 	std::vector<std::pair<u32, u32>> m_poll_park_sites;
@@ -2063,6 +2071,16 @@ public:
 			m_hash_start = hash_start;
 		}
 
+		// A listed program (SPUNativePrograms.h) calls entry() there once its entry check passes. It gets a
+		// name of its own: the persistent object cache is keyed by name and must never hand back an object
+		// built without the hook.
+		m_hooked = spu_native::is_hooked(m_hash.c_str());
+
+		if (m_hooked)
+		{
+			m_hash += "-hooked";
+		}
+
 #ifdef ARCH_ARM64
 		m_use_tbl2 = !g_spu_llvm_compile_context || g_spu_llvm_compile_context->use_tbl2;
 
@@ -2730,7 +2748,24 @@ public:
 				}
 
 #ifdef ARCH_ARM64
-				constexpr u32 checksum_states = states;
+				// The four states' differences are ORed as vectors and tested once (UMAXV), instead of
+				// moving each 64-bit half to a general register and ORing it there: three vector ORs and
+				// one reduction in place of eight moves and seven ORs. This runs on every entry to a
+				// program of 48 words or more; in The Last of Us these entry checks are a fifth of the
+				// compiled SPU code's time (Odin 3, 11-12 profile).
+				llvm::Value* difference_vec = nullptr;
+
+				for (u32 bank = 0; bank < states; bank++)
+				{
+					const auto constant = ConstantDataVector::get(m_context, llvm::ArrayRef(expected[bank].data(), lanes));
+					const auto x = m_ir->CreateXor(accumulators[bank], constant);
+					difference_vec = difference_vec ? m_ir->CreateOr(difference_vec, x) : x;
+				}
+
+				const auto difference = m_ir->CreateCall(get_intrinsic<u32, u32[4]>(llvm::Intrinsic::aarch64_neon_umaxv), {difference_vec});
+
+				// Compare result with zero
+				m_ir->CreateCondBr(m_ir->CreateICmpNE(difference, m_ir->getInt32(0)), label_diff, label_body, m_md_unlikely);
 #else
 				accumulators[0] = m_ir->CreateAdd(accumulators[0], accumulators[1]);
 
@@ -2740,7 +2775,6 @@ public:
 				}
 
 				constexpr u32 checksum_states = 1;
-#endif
 				llvm::Value* difference = nullptr;
 
 				for (u32 bank = 0; bank < checksum_states; bank++)
@@ -2756,6 +2790,7 @@ public:
 
 				// Compare result with zero
 				m_ir->CreateCondBr(m_ir->CreateICmpNE(difference, m_ir->getInt64(0)), label_diff, label_body, m_md_unlikely);
+#endif
 			}
 #ifdef ARCH_ARM64
 			else
@@ -3009,23 +3044,44 @@ public:
 
 		// Call the entry function chunk
 		const auto entry_chunk = add_function(m_pos);
-		const auto entry_call = m_ir->CreateCall(entry_chunk->chunk, {m_thread, m_lsptr, m_base_pc});
-		entry_call->setCallingConv(entry_chunk->chunk->getCallingConv());
 
 		const auto dispatcher = llvm::cast<llvm::Function>(m_module->getOrInsertFunction("spu_dispatcher", main_func->getType()).getCallee());
 		m_engine->updateGlobalMapping("spu_dispatcher", reinterpret_cast<u64>(spu_runtime::tr_all));
 		dispatcher->setCallingConv(main_func->getCallingConv());
 
-		// Proceed to the next code
-		if (entry_chunk->chunk->getReturnType() != get_type<void>())
+		if (m_hooked)
 		{
-			const auto next_call = m_ir->CreateCall(main_func->getFunctionType(), entry_call, {m_thread, m_lsptr, m_ir->getInt64(0)});
+			// The hook may run a native version in place of the translated code (still built): then it
+			// returns 0x80000000 | the address to continue at, and the dispatcher carries on from there as
+			// after any indirect branch. Otherwise it returns 0 and the translated code runs as usual.
+			const auto hook = call("spu_native_entry", &spu_native::entry, m_thread, m_lsptr, m_ir->getInt32(start0), m_ir->getInt64(m_hash_start));
+			const auto native_ran = llvm::BasicBlock::Create(m_context, "", m_function);
+			const auto translated = llvm::BasicBlock::Create(m_context, "", m_function);
+			m_ir->CreateCondBr(m_ir->CreateICmpSLT(hook, m_ir->getInt32(0)), native_ran, translated, m_md_unlikely);
+			m_ir->SetInsertPoint(native_ran);
+			m_ir->CreateStore(m_ir->CreateAnd(hook, 0x3fffc), spu_ptr(&spu_thread::pc));
+			const auto next_call = m_ir->CreateCall(main_func->getFunctionType(), dispatcher, {m_thread, m_lsptr, m_ir->getInt64(0)});
 			next_call->setCallingConv(main_func->getCallingConv());
 			next_call->setTailCall();
+			m_ir->CreateRetVoid();
+			m_ir->SetInsertPoint(translated);
 		}
-		else
+
 		{
-			entry_call->setTailCall();
+			const auto entry_call = m_ir->CreateCall(entry_chunk->chunk, {m_thread, m_lsptr, m_base_pc});
+			entry_call->setCallingConv(entry_chunk->chunk->getCallingConv());
+
+			// Proceed to the next code
+			if (entry_chunk->chunk->getReturnType() != get_type<void>())
+			{
+				const auto next_call = m_ir->CreateCall(main_func->getFunctionType(), entry_call, {m_thread, m_lsptr, m_ir->getInt64(0)});
+				next_call->setCallingConv(main_func->getCallingConv());
+				next_call->setTailCall();
+			}
+			else
+			{
+				entry_call->setTailCall();
+			}
 		}
 
 		m_ir->CreateRetVoid();
@@ -10898,6 +10954,36 @@ public:
 		return addr;
 	}
 
+	// ARMSX3: the end of a conditional branch through a register (BIZ, BINZ, BIHZ, BIHNZ). When the
+	// analyser offered the program's own entry as a target (a loop going back to its start, see
+	// spu_recompiler_base::analyse), going there when the register holds it stays inside the
+	// compiled code like a direct branch back would; any other address leaves through the dispatcher
+	// as before. One switch in the block that branches, so the entry block's PHI nodes see this
+	// block as their predecessor (add_block connects them to m_block->block_end).
+	void cond_branch_indirect(llvm::Value* cond, spu_opcode_t op, value_t<u32> addr)
+	{
+#ifdef __ANDROID__
+		const auto tfound = m_targets.find(m_pos);
+
+		if (!m_interp_magn && !op.d && !op.e && !(m_finfo && m_finfo->fn) && g_cfg.core.spu_block_size == spu_block_size_type::safe &&
+			tfound != m_targets.end() && std::count(tfound->second.begin(), tfound->second.end(), m_entry) && m_block_info[m_entry / 4] &&
+			m_block && m_block->block_end == m_ir->GetInsertBlock())
+		{
+			const auto self = add_block(m_entry);
+			const auto exit = add_block_indirect(op, addr);
+			const auto next = add_block_next();
+			const auto is_self = m_ir->CreateICmpEQ(addr.value, m_ir->getInt32(m_entry));
+			const auto taken = m_ir->CreateSelect(is_self, m_ir->getInt32(1), m_ir->getInt32(2));
+			const auto sw = m_ir->CreateSwitch(m_ir->CreateSelect(cond, taken, m_ir->getInt32(0)), next, 2);
+			sw->addCase(m_ir->getInt32(1), self);
+			sw->addCase(m_ir->getInt32(2), exit);
+			return;
+		}
+#endif
+		const auto target = add_block_indirect(op, addr);
+		m_ir->CreateCondBr(cond, target, add_block_next());
+	}
+
 	llvm::BasicBlock* add_block_indirect(spu_opcode_t op, value_t<u32> addr, bool ret = true)
 	{
 		if (m_interp_magn)
@@ -11051,8 +11137,7 @@ public:
 			m_block->block_end = m_ir->GetInsertBlock();
 			const auto cond = eval(extract(bitcast<u32[4]>(as), 0) == 0);
 			const auto addr = eval(extract(get_vr(op.ra), 3) & 0x3fffc);
-			const auto target = add_block_indirect(op, addr);
-			m_ir->CreateCondBr(cond.value, target, add_block_next());
+			cond_branch_indirect(cond.value, op, addr);
 			return;
 		}
 
@@ -11066,8 +11151,7 @@ public:
 			const auto b = extract(bitcast<u64[2]>(as), 1);
 			const auto cond = eval((a | b) == 0);
 			const auto addr = eval(extract(get_vr(op.ra), 3) & 0x3fffc);
-			const auto target = add_block_indirect(op, addr);
-			m_ir->CreateCondBr(cond.value, target, add_block_next());
+			cond_branch_indirect(cond.value, op, addr);
 			return;
 		}
 
@@ -11083,8 +11167,7 @@ public:
 				const auto a = get_vr<s8[16]>(op.rt);
 				const auto cond = eval(bitcast<s16>(trunc<bool[16]>(a)) >= 0);
 				const auto addr = eval(extract(get_vr(op.ra), 3) & 0x3fffc);
-				const auto target = add_block_indirect(op, addr);
-				m_ir->CreateCondBr(cond.value, target, add_block_next());
+				cond_branch_indirect(cond.value, op, addr);
 				return true;
 			}
 
@@ -11097,8 +11180,7 @@ public:
 #endif
 		const auto cond = eval(extract(get_vr(op.rt), 3) == 0);
 		const auto addr = eval(extract(get_vr(op.ra), 3) & 0x3fffc);
-		const auto target = add_block_indirect(op, addr);
-		m_ir->CreateCondBr(cond.value, target, add_block_next());
+		cond_branch_indirect(cond.value, op, addr);
 	}
 
 	void BINZ(spu_opcode_t op) //
@@ -11114,8 +11196,7 @@ public:
 			m_block->block_end = m_ir->GetInsertBlock();
 			const auto cond = eval(extract(bitcast<u32[4]>(as), 0) != 0);
 			const auto addr = eval(extract(get_vr(op.ra), 3) & 0x3fffc);
-			const auto target = add_block_indirect(op, addr);
-			m_ir->CreateCondBr(cond.value, target, add_block_next());
+			cond_branch_indirect(cond.value, op, addr);
 			return;
 		}
 
@@ -11129,8 +11210,7 @@ public:
 			const auto b = extract(bitcast<u64[2]>(as), 1);
 			const auto cond = eval((a | b) != 0);
 			const auto addr = eval(extract(get_vr(op.ra), 3) & 0x3fffc);
-			const auto target = add_block_indirect(op, addr);
-			m_ir->CreateCondBr(cond.value, target, add_block_next());
+			cond_branch_indirect(cond.value, op, addr);
 			return;
 		}
 
@@ -11146,8 +11226,7 @@ public:
 				const auto a = get_vr<s8[16]>(op.rt);
 				const auto cond = eval(bitcast<s16>(trunc<bool[16]>(a)) < 0);
 				const auto addr = eval(extract(get_vr(op.ra), 3) & 0x3fffc);
-				const auto target = add_block_indirect(op, addr);
-				m_ir->CreateCondBr(cond.value, target, add_block_next());
+				cond_branch_indirect(cond.value, op, addr);
 				return true;
 			}
 
@@ -11160,8 +11239,7 @@ public:
 #endif
 		const auto cond = eval(extract(get_vr(op.rt), 3) != 0);
 		const auto addr = eval(extract(get_vr(op.ra), 3) & 0x3fffc);
-		const auto target = add_block_indirect(op, addr);
-		m_ir->CreateCondBr(cond.value, target, add_block_next());
+		cond_branch_indirect(cond.value, op, addr);
 	}
 
 	void BIHZ(spu_opcode_t op) //
@@ -11179,8 +11257,7 @@ public:
 				const auto a = get_vr<s8[16]>(op.rt);
 				const auto cond = eval((bitcast<s16>(trunc<bool[16]>(a)) & 0x3000) == 0);
 				const auto addr = eval(extract(get_vr(op.ra), 3) & 0x3fffc);
-				const auto target = add_block_indirect(op, addr);
-				m_ir->CreateCondBr(cond.value, target, add_block_next());
+				cond_branch_indirect(cond.value, op, addr);
 				return true;
 			}
 
@@ -11193,8 +11270,7 @@ public:
 #endif
 		const auto cond = eval(extract(get_vr<u16[8]>(op.rt), 6) == 0);
 		const auto addr = eval(extract(get_vr(op.ra), 3) & 0x3fffc);
-		const auto target = add_block_indirect(op, addr);
-		m_ir->CreateCondBr(cond.value, target, add_block_next());
+		cond_branch_indirect(cond.value, op, addr);
 	}
 
 	void BIHNZ(spu_opcode_t op) //
@@ -11212,8 +11288,7 @@ public:
 				const auto a = get_vr<s8[16]>(op.rt);
 				const auto cond = eval((bitcast<s16>(trunc<bool[16]>(a)) & 0x3000) != 0);
 				const auto addr = eval(extract(get_vr(op.ra), 3) & 0x3fffc);
-				const auto target = add_block_indirect(op, addr);
-				m_ir->CreateCondBr(cond.value, target, add_block_next());
+				cond_branch_indirect(cond.value, op, addr);
 				return true;
 			}
 
@@ -11226,8 +11301,7 @@ public:
 #endif
 		const auto cond = eval(extract(get_vr<u16[8]>(op.rt), 6) != 0);
 		const auto addr = eval(extract(get_vr(op.ra), 3) & 0x3fffc);
-		const auto target = add_block_indirect(op, addr);
-		m_ir->CreateCondBr(cond.value, target, add_block_next());
+		cond_branch_indirect(cond.value, op, addr);
 	}
 
 	void BI(spu_opcode_t op) //
@@ -11248,9 +11322,45 @@ public:
 		{
 			// Interrupts-disable pattern
 			m_ir->CreateStore(m_ir->getFalse(), spu_ptr(&spu_thread::interrupts_enabled));
+#ifdef __ANDROID__
+
+			// ARMSX3: SPU Inline Interrupt Idioms. The analyser leaves this single target for each idiom
+			// it takes in line with the setting on, and also, on or off, when the next instruction starts
+			// a block anyway; there stock code falls through unchecked. With the setting on, go on to the
+			// next instruction only when the register holds its address, and take the indirect branch
+			// otherwise: the analyser read the target off an immediate, and compiled code also runs where
+			// the same bytes turn up at another address (see BRA)
+			if (g_cfg.core.spu_inline_interrupt_idioms)
+			{
+				const auto exit = add_block_indirect(op, addr);
+				m_ir->CreateCondBr(m_ir->CreateICmpEQ(addr.value, get_pc(m_pos + 4)), add_block(spu_branch_target(m_pos, 1)), exit, m_md_likely);
+			}
+
+#endif
 			return;
 		}
 
+#ifdef __ANDROID__
+		if (op.e && !op.d && tfound != m_targets.end() && tfound->second.size() == 2 && tfound->second[0] == spu_branch_target(m_pos, 1) &&
+			tfound->second[1] == SPU_LS_SIZE && g_cfg.core.spu_inline_interrupt_idioms && g_cfg.core.spu_block_size == spu_block_size_type::mega)
+		{
+			// ARMSX3: interrupts-enable pattern, with SPU Inline Interrupt Idioms on (with SPU Block Size
+			// Mega the analyser leaves these two targets only then; Giga leaves them as well). With no
+			// busy-checked event in the mask and no masked event pending (ch_events: mask in bits 32-63,
+			// count in bit 31), all exec_check_interrupts does is set the flag: do that here and go on
+			// to the next instruction. Anything else, or a register that does not hold the next address
+			// (as in the pattern above), takes the branch as with the setting off, call included, which
+			// sets the flag again
+			const auto events = m_ir->CreateLoad(get_type<u64>(), spu_ptr(&spu_thread::ch_events), true);
+			const auto quiet = m_ir->CreateICmpEQ(m_ir->CreateAnd(events, m_ir->getInt64(u64{SPU_EVENT_INTR_BUSY_CHECK} << 32 | u64{1} << 31)), m_ir->getInt64(0));
+			const auto here = m_ir->CreateICmpEQ(addr.value, get_pc(m_pos + 4));
+			m_ir->CreateStore(m_ir->getInt8(1), spu_ptr(&spu_thread::interrupts_enabled));
+			const auto exit = add_block_indirect(op, addr);
+			m_ir->CreateCondBr(m_ir->CreateAnd(quiet, here), add_block(spu_branch_target(m_pos, 1)), exit, m_md_likely);
+			return;
+		}
+
+#endif
 		if (!op.d && !op.e && tfound != m_targets.end() && tfound->second.size() > 1)
 		{
 			// Shift aligned address for switch

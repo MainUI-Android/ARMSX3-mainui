@@ -47,6 +47,15 @@
 #include "rpcs3_version.h"
 #include <elf.h>
 #include <link.h>
+// The SPU object cache key's code identity, which android/spu_codegen_identity.py writes into the
+// build directory before anything here compiles. While that script hashes this file a placeholder
+// stands in, so the file does not depend on its own result and is otherwise hashed exactly as it
+// compiles. Without the header the key falls back to the build itself.
+#if defined(ARMSX3_SPU_IDENTITY_HASHING)
+#define ARMSX3_ANDROID_SPU_CODEGEN_IDENTITY "hashing"
+#elif __has_include(<spu_codegen_identity_android.h>)
+#include <spu_codegen_identity_android.h>
+#endif
 #endif
 
 const extern spu_decoder<spu_itype> g_spu_itype;
@@ -158,17 +167,42 @@ static void spu_reset_failed_blocks()
 	s_spu_failed_blocks.clear();
 }
 
-#ifdef __APPLE__
+// Background SPU compiles: new code is interpreted while an LLVM worker compiles it, instead of the
+// SPU thread stopping until its own compile finishes. x86 has the spu_fast first tier for this and
+// ARM64 has none. Written for Apple; on Android too since 11-10, where every first-time compile
+// stopped the game for 100 to 300 ms and a new area strung several seconds of them together. Off
+// while Pause Game During SPU Compilation is on (spu_async_compile_enabled), so a title that needs
+// its compiles hidden from its timers keeps that.
+#if defined(__APPLE__) || defined(__ANDROID__)
+#define SPU_ASYNC_COMPILE 1
+#endif
+
+#ifdef SPU_ASYNC_COMPILE
 // Ranges still compiling in the background, and every program ever queued so each is queued once
 static shared_mutex s_spu_async_mutex;
 static std::vector<std::pair<u32, u32>> s_spu_async_pending;
 static std::unordered_set<u64> s_spu_async_queued;
+static atomic_t<bool> s_spu_async_logged{false};
 
 static void spu_reset_async_compiles()
 {
 	std::lock_guard lock(s_spu_async_mutex);
 	s_spu_async_pending.clear();
 	s_spu_async_queued.clear();
+	s_spu_async_logged = false;
+}
+
+// True while old_interpreter runs a range that spu_async_dispatch sent it, as opposed to a block
+// that failed to compile: only the first can become compiled code while it runs. Each path into
+// the interpreter sets it, so an escape that skips the reset cannot carry it into the other path.
+static thread_local bool t_spu_async_interp = false;
+static thread_local u32 t_spu_async_backedges = 0;
+
+// Whether a range sent to the interpreter is still compiling
+static bool spu_async_range_pending(u32 begin, u32 end)
+{
+	reader_lock lock(s_spu_async_mutex);
+	return std::find(s_spu_async_pending.begin(), s_spu_async_pending.end(), std::pair<u32, u32>{begin, end}) != s_spu_async_pending.end();
 }
 
 #endif
@@ -375,6 +409,11 @@ static void spu_run_interp_fallback(spu_thread& spu, u32 lower_bound = 0, u32 si
 	// exactly the paths the flag is set for. cpu_task's loop is where control lands afterwards,
 	// and it runs on both the normal and the escaping path.
 	spu.allow_interrupts_in_cpu_work = true;
+
+#ifdef SPU_ASYNC_COMPILE
+	// A block that failed to compile stays interpreted until execution leaves it
+	t_spu_async_interp = false;
+#endif
 
 	spu_recompiler_base::old_interpreter(spu, spu._ptr<u8>(0), nullptr);
 
@@ -1218,6 +1257,28 @@ void spu_cache::add(const spu_program& func)
 	m_file.write_gather(gather, 3);
 }
 
+#ifdef __ANDROID__
+// "<cache>/cache/<title>/" for an executable's cache folder "<cache>/cache/<title>/ppu-<hash>-EBOOT.BIN/",
+// or empty for any other shape. A game update installs a new executable, which gets a folder of its
+// own beside the old version's.
+static std::string spu_title_cache_dir(std::string_view exec_cache)
+{
+	if (exec_cache.ends_with('/'))
+	{
+		exec_cache.remove_suffix(1);
+	}
+
+	const usz slash = exec_cache.find_last_of('/');
+
+	if (slash == umax || !exec_cache.substr(slash + 1).starts_with("ppu-"))
+	{
+		return {};
+	}
+
+	return std::string(exec_cache.substr(0, slash + 1));
+}
+#endif
+
 void spu_cache::initialize(bool build_existing_cache)
 {
 	jit_write_guard jit_guard;
@@ -1240,7 +1301,18 @@ void spu_cache::initialize(bool build_existing_cache)
 	}
 
 	// SPU cache file (version + block size type)
+#ifdef __ANDROID__
+	// ARMSX3: a list of its own with SPU Inline Interrupt Idioms on. With it the functions that run are
+	// not the ones a stock list holds (the code after a bid or bie no longer starts a function), and a
+	// list is rebuilt at every boot on a fake local store that holds one function at a time, so a shared
+	// list would keep feeding each side the other's functions. For bie it is what makes the setting act
+	// at all: a listed function that ends at its bie is rebuilt just as short, and where one function is
+	// the beginning of another the dispatcher runs the shorter one. A new list starts empty, like the
+	// first one after a change of SPU Block Size.
+	const std::string filename = "spu-" + fmt::to_lower(g_cfg.core.spu_block_size.to_string()) + (g_cfg.core.spu_inline_interrupt_idioms ? "-inline" : "") + "-v1-tane.dat";
+#else
 	const std::string filename = "spu-" + fmt::to_lower(g_cfg.core.spu_block_size.to_string()) + "-v1-tane.dat";
+#endif
 	const std::string loc = ppu_cache + filename;
 	const std::string loc_debug = fs::get_cache_dir() + "DEBUG/" + filename;
 
@@ -1251,6 +1323,50 @@ void spu_cache::initialize(bool build_existing_cache)
 		spu_log.success("SPU Cache override applied!");
 		is_debug = true;
 	}
+
+#ifdef __ANDROID__
+	// A game update installs a new executable, which gets its own cache folder and so an empty SPU
+	// list, though most of its SPU programs are the ones the old version ran. Start the list from the
+	// largest one another executable of the same game left, so those programs are built at boot
+	// (mostly just loaded, as the objects are kept per game) instead of compiled one at a time in
+	// play. Drakengard 3 (11-10): 01.01 started from nothing after a whole session on 01.00.
+	if (fs::stat_t st{}; !is_debug && (!fs::get_stat(loc, st) || st.size == 0))
+	{
+		if (const std::string title_dir = spu_title_cache_dir(ppu_cache); !title_dir.empty())
+		{
+			std::string best;
+			u64 best_size = 0;
+
+			for (auto&& entry : fs::dir(title_dir))
+			{
+				if (!entry.is_directory || !entry.name.starts_with("ppu-") || title_dir + entry.name + "/" == ppu_cache)
+				{
+					continue;
+				}
+
+				if (fs::stat_t other{}; fs::get_stat(title_dir + entry.name + "/" + filename, other) && other.size > best_size)
+				{
+					best = title_dir + entry.name + "/" + filename;
+					best_size = other.size;
+				}
+			}
+
+			if (!best.empty())
+			{
+				const fs::file src(best);
+				const std::vector<u8> data = src ? src.to_vector<u8>() : std::vector<u8>{};
+
+				if (!data.empty())
+				{
+					if (fs::file dst(loc, fs::rewrite); dst && dst.write(data.data(), data.size()) == data.size())
+					{
+						spu_log.notice("SPU cache: this executable's list starts from another executable of the same game (%s, %u bytes).", best, data.size());
+					}
+				}
+			}
+		}
+	}
+#endif
 
 	spu_cache cache(is_debug ? loc_debug : loc);
 
@@ -1830,7 +1946,9 @@ static const char* spu_obj_cache_off_reason()
 		return "ARMSX3_SPU_OBJ_CACHE=0";
 	}
 
-	for (const char* lever : {"ARMSX3_SPU_INTERP", "ARMSX3_SPU_INTERP_RANGE", "ARMSX3_SPU_TRAP_PC", "ARMSX3_SHUFB_CHECK", "ARMSX3_SHUFB_SKIP"})
+	// ARMSX3_WATCH_LS and ARMSX3_KZ3_SYNC make WRCH call the C++ DMA path instead of inlining the
+	// transfer (spu_ls_watch_enabled, kz3_sync_probe_enabled), so a cached object would bypass them.
+	for (const char* lever : {"ARMSX3_SPU_INTERP", "ARMSX3_SPU_INTERP_RANGE", "ARMSX3_SPU_TRAP_PC", "ARMSX3_SHUFB_CHECK", "ARMSX3_SHUFB_SKIP", "ARMSX3_WATCH_LS", "ARMSX3_KZ3_SYNC"})
 	{
 		if (set(std::getenv(lever)))
 		{
@@ -1847,7 +1965,7 @@ static const char* spu_obj_cache_off_reason()
 // before it. Folded into the object cache key, it keeps objects from one binary away from any
 // other: the SPU codegen also lives in files that hold no build stamp of their own
 // (JITLLVM.cpp, CPUTranslator.cpp, the AArch64 GHC pass).
-static std::string spu_obj_cache_build_id()
+[[maybe_unused]] static std::string spu_obj_cache_build_id()
 {
 	struct search_t
 	{
@@ -1940,7 +2058,13 @@ static std::string spu_obj_cache_parent(const std::string& game_cache)
 
 	if (!data_cache.empty() && game_cache.starts_with(data_cache) && game_cache.size() > data_cache.size())
 	{
-		return g_android_private_cache_dir + "spuobj/" + game_cache.substr(data_cache.size());
+		// One folder per game, not per executable. An object is named after its SPU program's bytes,
+		// entry and start (SPULLVMRecompiler.cpp), and the key below holds everything else that
+		// shapes it, so nothing in it belongs to one executable: a game update's new executable reuses
+		// every object the old version built, and so does a game's second executable.
+		const std::string title_cache = spu_title_cache_dir(game_cache);
+		const std::string& base = title_cache.empty() ? game_cache : title_cache;
+		return g_android_private_cache_dir + "spuobj/" + base.substr(data_cache.size());
 	}
 
 	// Not under the data folder's cache: named after its whole path instead.
@@ -1972,7 +2096,12 @@ static u64 spu_obj_cache_settings()
 		static_cast<u64>(g_cfg.core.spu_loop_detection.get()) << 32 |
 		static_cast<u64>(g_cfg.core.mfc_debug.get()) << 33 |
 		static_cast<u64>(g_cfg.core.rsx_accurate_res_access.get()) << 34 |
-		static_cast<u64>(g_cfg.savestate.compatible_mode.get()) << 35;
+		static_cast<u64>(g_cfg.savestate.compatible_mode.get()) << 35 |
+		static_cast<u64>(g_cfg.core.spu_debug.get()) << 36
+#ifdef __ANDROID__
+		| static_cast<u64>(g_cfg.core.spu_inline_interrupt_idioms.get()) << 37
+#endif
+		;
 }
 
 const std::string& spu_runtime::get_obj_cache_path() const
@@ -1996,6 +2125,14 @@ const std::string& spu_runtime::get_obj_cache_path() const
 #endif
 spu_runtime::spu_runtime()
 {
+#ifdef __ANDROID__
+	if (g_cfg.core.spu_inline_interrupt_idioms && g_cfg.core.spu_decoder == spu_decoder_type::llvm)
+	{
+		spu_log.notice("SPU Inline Interrupt Idioms: on, %s", g_cfg.core.spu_block_size == spu_block_size_type::mega ?
+			"bid and bie compiled in line" : "bid compiled in line (bie only with SPU Block Size Mega)");
+	}
+
+#endif
 	// Drop the previous session's failed-block set.
 	//
 	// It is keyed on local-store offsets, which are per-thread 18-bit addresses that every SPU
@@ -2009,7 +2146,7 @@ spu_runtime::spu_runtime()
 	// fail to compile a block, so no other target has anything to reset.
 #ifdef ARCH_ARM64
 	spu_reset_failed_blocks();
-#ifdef __APPLE__
+#ifdef SPU_ASYNC_COMPILE
 	spu_reset_async_compiles();
 #endif
 #endif
@@ -2085,6 +2222,13 @@ spu_runtime::spu_runtime()
 		static constexpr std::string_view s_llvm_version = LLVM_VERSION_STRING;
 		sha1_update(&ctx, reinterpret_cast<const u8*>(s_llvm_version.data()), s_llvm_version.size());
 #endif
+#elif defined(ARMSX3_ANDROID_SPU_CODEGEN_IDENTITY)
+		// A hash of the code that decides what SPU machine code comes out, LLVM included
+		// (android/spu_codegen_identity.py), in place of the build stamps below and the build in
+		// the Android block further down: an update that leaves that code alone keeps every
+		// player's cache, and any change to it, a header it includes or LLVM starts a fresh one.
+		static constexpr std::string_view s_codegen_identity = ARMSX3_ANDROID_SPU_CODEGEN_IDENTITY;
+		sha1_update(&ctx, reinterpret_cast<const u8*>(s_codegen_identity.data()), s_codegen_identity.size());
 #else
 		// Build stamp, so a remembered version bump is not the only thing between a new binary and
 		// the objects an old one emitted.
@@ -2182,6 +2326,24 @@ spu_runtime::spu_runtime()
 		fold(hw2);
 		const u32 spu_decoder = static_cast<u32>(g_cfg.core.spu_decoder.get());
 		fold(spu_decoder);
+		// The translator takes the SVE paths only at a 128-bit vector length (CPUTranslator.cpp),
+		// and SPU Debug stores block hashes into the emitted code the way SPU Profiler does.
+		// sve_length() executes an SVE instruction, so only a core with SVE may ask.
+		const s32 sve_bits = utils::has_sve() ? utils::sve_length() : 0;
+		fold(sve_bits);
+		const u32 spu_debug = static_cast<u32>(g_cfg.core.spu_debug.get());
+		fold(spu_debug);
+
+		// SPU Inline Interrupt Idioms changes the code built for the same SPU program. Folded only when
+		// on, so with it off the key is made of what it was made of before the setting existed.
+		if (g_cfg.core.spu_inline_interrupt_idioms)
+		{
+			const u32 inline_idioms = 1;
+			fold(inline_idioms);
+		}
+#ifdef ARMSX3_ANDROID_SPU_CODEGEN_IDENTITY
+		spu_log.notice("SPU object cache key: codegen %s", ARMSX3_ANDROID_SPU_CODEGEN_IDENTITY);
+#else
 		const auto [app_commit, app_hash] = rpcs3::get_commit_and_hash();
 		sha1_update(&ctx, reinterpret_cast<const u8*>(app_commit.data()), app_commit.size());
 		sha1_update(&ctx, reinterpret_cast<const u8*>(app_hash.data()), app_hash.size());
@@ -2190,6 +2352,7 @@ spu_runtime::spu_runtime()
 		const std::string build_id = spu_obj_cache_build_id();
 		sha1_update(&ctx, reinterpret_cast<const u8*>(build_id.data()), build_id.size());
 		spu_log.notice("SPU object cache key: build %s, commit %s-%s", build_id.empty() ? "(no build ID)" : build_id, app_commit, app_hash);
+#endif
 
 #endif
 		// The key's settings as they are now, so a change during play turns the cache off (get_obj_cache_path)
@@ -2265,6 +2428,28 @@ spu_runtime::spu_runtime()
 		};
 
 		drop_other_caches(obj_parent);
+
+		// Until 11-10 the objects were kept per executable, one folder further down. Those folders
+		// go too, each executable's folder with them once empty. Only this game's folder in the
+		// app's private cache is walked.
+		if (!g_android_private_cache_dir.empty() && obj_parent.starts_with(g_android_private_cache_dir))
+		{
+			std::vector<std::string> exec_dirs;
+
+			for (auto&& entry : fs::dir(obj_parent))
+			{
+				if (entry.is_directory && entry.name.starts_with("ppu-"))
+				{
+					exec_dirs.push_back(obj_parent + entry.name + "/");
+				}
+			}
+
+			for (const std::string& dir : exec_dirs)
+			{
+				drop_other_caches(dir);
+				fs::remove_dir(dir);
+			}
+		}
 
 		if (obj_parent != m_cache_path)
 		{
@@ -3313,7 +3498,7 @@ static spu_function_t compile_spu_llvm_paused(spu_thread& spu, const spu_program
 }
 #endif
 
-#if defined(__APPLE__) && defined(ARCH_ARM64)
+#ifdef SPU_ASYNC_COMPILE
 // No fast tier on ARM64, so new code compiles in the background and its range is interpreted meanwhile
 static bool spu_async_compile_enabled()
 {
@@ -3443,6 +3628,11 @@ static bool spu_async_dispatch(spu_thread& spu, std::unique_ptr<spu_recompiler_b
 			s_spu_async_pending.push_back(range);
 		}
 
+		if (!s_spu_async_logged.exchange(true))
+		{
+			spu_log.notice("SPU: new code at 0x%05x compiles in the background, and the SPU interprets it meanwhile instead of waiting.", program.entry_point);
+		}
+
 		const u32 i = async.next++ % 2;
 		(async.workers->begin() + i)->queue.push(std::move(program));
 	}
@@ -3453,6 +3643,9 @@ static bool spu_async_dispatch(spu_thread& spu, std::unique_ptr<spu_recompiler_b
 	spu.interp_fallback = true;
 	// As spu_run_interp_fallback: cpu_task clears it, and an escape skips anything after the interpreter
 	spu.allow_interrupts_in_cpu_work = true;
+	// This range becomes compiled code while it runs: see old_interpreter
+	t_spu_async_interp = true;
+	t_spu_async_backedges = 0;
 	spu_recompiler_base::old_interpreter(spu, spu._ptr<u8>(0), nullptr);
 	spu_runtime::g_escape(&spu);
 	return true;
@@ -3566,7 +3759,7 @@ void spu_recompiler_base::dispatch(spu_thread& spu, void*, u8* rip)
 		spu_run_interp_fallback(spu);
 		return;
 	}
-#ifdef __APPLE__
+#ifdef SPU_ASYNC_COMPILE
 
 	if (spu_async_dispatch(spu, spu.jit))
 	{
@@ -3781,8 +3974,36 @@ void spu_recompiler_base::old_interpreter(spu_thread& spu, void* ls, u8* /*rip*/
 		}
 
 		const u32 op = *reinterpret_cast<const be_t<u32>*>(base + spu.pc);
+#ifdef SPU_ASYNC_COMPILE
+		const u32 pc_before = spu.pc;
+#endif
 		if (table.decode(op)(spu, {op}))
 			spu.pc += 4;
+
+#ifdef SPU_ASYNC_COMPILE
+		// A loop that started here while its range compiled in the background leaves at a loop head
+		// once that compile is done, and the dispatcher takes it from there with compiled code (it
+		// compiles the loop head as a program of its own first if it has to). Without this the
+		// interpreter kept a loop until execution left the range, so a job whose main loop began
+		// a moment before its code was ready ran all of it ten to fifty times slower, however soon
+		// the compile finished. Checked on every 256th backward branch: the lookup takes a lock.
+		if (spu.pc <= pc_before && t_spu_async_interp && spu.interp_fallback) [[unlikely]]
+		{
+			if ((++t_spu_async_backedges & 255) == 0 && !spu_async_range_pending(spu.interp_fallback_begin, spu.interp_fallback_end))
+			{
+				static atomic_t<bool> s_logged{false};
+
+				if (!s_logged.exchange(true))
+				{
+					spu_log.notice("SPU: a loop at 0x%05x left the interpreter for compiled code once its background compile finished.", spu.pc);
+				}
+
+				spu.interp_fallback = false;
+				t_spu_async_interp = false;
+				break;
+			}
+		}
+#endif
 	}
 }
 
@@ -4553,6 +4774,21 @@ spu_program spu_recompiler_base::analyse(const be_t<u32>* ls, u32 entry_point, s
 				spu_log.error("[0x%x] Invalid interrupt flags (DE)", pos);
 			}
 
+#ifdef __ANDROID__
+			if (type == spu_itype::BI && (op.d || (op.e && g_cfg.core.spu_block_size == spu_block_size_type::mega)) && g_cfg.core.spu_inline_interrupt_idioms)
+			{
+				// ARMSX3: SPU Inline Interrupt Idioms. A block that starts inside the one holding this
+				// branch gets the branch analysed again, maybe without the constant or after a SYNC: drop
+				// the edge to the next instruction that the idiom paths below may have made on an earlier
+				// pass. They make it again if they still apply; otherwise the next block would keep a
+				// predecessor that does not branch to it
+				if (const auto found = m_preds.find(pos + 4); found != m_preds.end())
+				{
+					std::erase(found->second, pos);
+				}
+			}
+
+#endif
 			const auto af = vflags[op.ra];
 			const auto av = values[op.ra];
 			const bool sl = type == spu_itype::BISL || type == spu_itype::BISLED;
@@ -4606,7 +4842,19 @@ spu_program spu_recompiler_base::analyse(const be_t<u32>* ls, u32 entry_point, s
 				if (type == spu_itype::BI && target == pos + 4 && op.d)
 				{
 					// Disable interrupts idiom
-#ifdef __APPLE__
+#ifdef __ANDROID__
+					// ARMSX3: with SPU Inline Interrupt Idioms on, Android takes the Apple path below, and the
+					// LLVM recompiler then checks the address at run time (BI). Not after a SYNC in the same
+					// block, after which the analyser follows no indirect branch (jump tables, Giga calls)
+					// either, nor with the E flag set as well (invalid, logged above), whose branch also
+					// checks for interrupts. Otherwise the branch leaves the function as before
+					if (!g_cfg.core.spu_inline_interrupt_idioms || sync || op.e)
+					{
+						break;
+					}
+
+#endif
+#if defined(__APPLE__) || defined(__ANDROID__)
 					// Both recompilers take this path only when m_targets holds pos+4, and pos+4 must be a block for the target prune to keep it
 					m_targets[pos].push_back(target);
 					add_block(target);
@@ -4615,6 +4863,22 @@ spu_program spu_recompiler_base::analyse(const be_t<u32>* ls, u32 entry_point, s
 					break;
 				}
 
+#ifdef __ANDROID__
+				if (type == spu_itype::BI && target == pos + 4 && op.e && !sync && g_cfg.core.spu_inline_interrupt_idioms && g_cfg.core.spu_block_size == spu_block_size_type::mega)
+				{
+					// ARMSX3: enable interrupts idiom, with SPU Inline Interrupt Idioms on. The function is
+					// not cut at the next instruction: to the rest of the analysis this is a conditional
+					// indirect branch, as a biz is, that goes on to the next instruction or leaves (for the
+					// interrupt handler, or where the register points). The LLVM recompiler decides at run
+					// time (BI). Mega only: Giga already keeps the code after it in the function, as an entry
+					m_targets[pos].push_back(target);
+					m_targets[pos].push_back(SPU_LS_SIZE);
+					add_block(target);
+					next_block();
+					break;
+				}
+
+#endif
 				m_targets[pos].push_back(target);
 
 				if (g_cfg.core.spu_block_size == spu_block_size_type::giga)
@@ -4843,6 +5107,32 @@ spu_program spu_recompiler_base::analyse(const be_t<u32>* ls, u32 entry_point, s
 				spu_log.warning("[0x%x] At 0x%x: Undetected interrupt branch target (ra=%d)", entry_point, pos, op.ra);
 			}
 
+#ifdef __ANDROID__
+			if (type == spu_itype::BIZ || type == spu_itype::BINZ || type == spu_itype::BIHZ || type == spu_itype::BIHNZ)
+			{
+				// ARMSX3: a conditional branch through a register that may be a loop going back to this
+				// program's own start. The Last of Us ends its software-pipelined SPU loops that way (binz
+				// r57 at 0x074dc, with r57 = 0x073f8 the program's entry in every capture), and with no
+				// target known here each trip round the loop left through the dispatcher: the registers
+				// stored, the whole program's code checked again on entry, the registers loaded again.
+				// The entry is offered as a target, which the LLVM recompiler takes only when the register
+				// holds it at run time (cond_branch_indirect) and otherwise leaves as before. It is the edge
+				// a direct branch back to the entry would make: the entry block gets the state check
+				// every loop head gets. Safe block size only, and not after a SYNC or with D or E set.
+				//
+				// A block that starts inside this one gets the branch analysed again, maybe with the
+				// register known by then: drop an edge an earlier pass made, as nothing else in this case
+				// gives a conditional indirect branch an edge to the entry in Safe mode.
+				std::erase(m_preds[entry_point], pos);
+
+				if (!(af & vf::is_const) && !op.d && !op.e && !sync && g_cfg.core.spu_block_size == spu_block_size_type::safe)
+				{
+					m_targets[pos].push_back(entry_point);
+					add_block(entry_point);
+				}
+			}
+
+#endif
 			if (!(af & vf::is_const) || op.e)
 			{
 				// Possible unknown target

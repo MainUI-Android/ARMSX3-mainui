@@ -67,6 +67,7 @@ private:
 	const VKVertexProgram *m_vertex_prog = nullptr;
 	vk::glsl::program *m_program = nullptr;
 	vk::glsl::program *m_prev_program = nullptr;
+	bool m_last_program_interpreted = false;            // ARMSX3: the last draw that ran used the shader interpreter
 	// ARMSX3: vertex fetch specialization (vk_vspec.h), all unused while it is off
 	vk::glsl::program *m_generic_program = nullptr;     // Generic variant of a specialized m_program
 	std::array<u32, 16> m_bound_vtx_spec{};             // Specialization of m_program, all zero = generic
@@ -139,6 +140,14 @@ private:
 	u32 m_early_submit_threshold = 0;     // 0 = off, else >= 256
 	u32 m_draws_since_submit = 0;         // Draws recorded into the open primary command buffer
 	u32 m_early_submit_check_at = umax;   // Draw count at which to ask the GPU next; umax when off
+
+	// Fence poll completion markers ("Fence Poll Completion Markers"), see arm_completion_marker.
+	// One mapped u32 per primary command buffer, written by the GPU; null while the setting is off.
+	std::unique_ptr<vk::buffer> m_cb_done_markers;
+	u32* m_cb_done_marker_map = nullptr;
+	u32 m_cb_done_slots = 0;              // Slots handed out to command buffers so far
+	u32 m_cb_done_seq = 0;                // Last value written; every armed submission gets its own
+	void arm_completion_marker(vk::command_buffer_chunk* cmd);
 
 	std::unique_ptr<vk::buffer> m_host_object_data;
 	vk::framebuffer_holder* m_draw_fbo = nullptr;

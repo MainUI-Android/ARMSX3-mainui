@@ -257,12 +257,11 @@ namespace psf
 					// Find null terminator
 					if (usz nts = value.find_first_of('\0'); nts != umax)
 					{
-						if (nts < value.size() - 1)
-						{
-							// Unexpected non-NTS characters after NTS was encountered
-							PSF_CHECK(value.find_first_not_of('\0', nts + 1) == umax, error::corrupt);
-						}
-
+						// Anything after the terminator is ignored. Upstream #20034 rejected such files as
+						// corrupt, but the EU discs of God of War III (BCES00510) and Ascension (BCES01741)
+						// ship PARAM.SFO strings with bytes after the NUL, and the check hid those games
+						// (RPCS3 #20075). The length checks above, which keep a bad file from crashing the
+						// loader, stay.
 						value.resize(nts);
 					}
 				}
