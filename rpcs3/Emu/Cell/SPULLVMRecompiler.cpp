@@ -10962,7 +10962,7 @@ public:
 	// block as their predecessor (add_block connects them to m_block->block_end).
 	void cond_branch_indirect(llvm::Value* cond, spu_opcode_t op, value_t<u32> addr)
 	{
-#ifdef __ANDROID__
+#if defined(__ANDROID__) || (defined(__APPLE__) && defined(ARCH_ARM64))
 		const auto tfound = m_targets.find(m_pos);
 
 		if (!m_interp_magn && !op.d && !op.e && !(m_finfo && m_finfo->fn) && g_cfg.core.spu_block_size == spu_block_size_type::safe &&
@@ -11322,7 +11322,7 @@ public:
 		{
 			// Interrupts-disable pattern
 			m_ir->CreateStore(m_ir->getFalse(), spu_ptr(&spu_thread::interrupts_enabled));
-#ifdef __ANDROID__
+#if defined(__ANDROID__) || (defined(__APPLE__) && defined(ARCH_ARM64))
 
 			// ARMSX3: SPU Inline Interrupt Idioms. The analyser leaves this single target for each idiom
 			// it takes in line with the setting on, and also, on or off, when the next instruction starts
@@ -11340,7 +11340,7 @@ public:
 			return;
 		}
 
-#ifdef __ANDROID__
+#if defined(__ANDROID__) || (defined(__APPLE__) && defined(ARCH_ARM64))
 		if (op.e && !op.d && tfound != m_targets.end() && tfound->second.size() == 2 && tfound->second[0] == spu_branch_target(m_pos, 1) &&
 			tfound->second[1] == SPU_LS_SIZE && g_cfg.core.spu_inline_interrupt_idioms && g_cfg.core.spu_block_size == spu_block_size_type::mega)
 		{
