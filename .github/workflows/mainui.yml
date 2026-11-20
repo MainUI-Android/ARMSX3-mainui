@@ -151,6 +151,10 @@ jobs:
           export PATH="$ANDROID_HOME/cmake/$CMAKE_VERSION/bin:$PATH"
           targets=android/libarmsx3-core.so
           if ninja -C build-android -t targets all | grep -q '^armsx3_lsfg:'; then targets="$targets armsx3_lsfg"; fi
+          # (upstream's armsx3_spu_codegen_identity preprocesses LLVM headers without depending on
+          # LLVM's tablegen targets: generate those first)
+          gen=$(ninja -C build-android -t targets all | sed -nE 's/^([A-Za-z0-9_]+(_gen|TableGen)): phony$/\1/p' | sort -u)
+          if [ -n "$gen" ]; then timeout 19000 ninja -C build-android $gen; fi
           timeout 19000 ninja -C build-android $targets
       - name: Save ccache
         if: always()
