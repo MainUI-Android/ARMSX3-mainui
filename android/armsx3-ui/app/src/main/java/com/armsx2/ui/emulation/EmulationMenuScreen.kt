@@ -1351,7 +1351,8 @@ private fun PerformancePane(state: EmulationMenuUiState, viewModel: EmulationMen
     // The PS3's processors, not the PS2's. EE/IOP/VU0/VU1/Fastmem are PCSX2
     // recompiler toggles for silicon that does not exist here.
     // Frame generation first: it is the one setting here that changes the framerate rather than
-    // how fast the emulator runs. Only the github build draws it.
+    // how fast the emulator runs. ZeroFG's card is in every build; the experimental one only in the github build.
+    ZeroFgCard(settings, viewModel)
     FrameGenCard(settings, viewModel)
     SectionCard(str("perf.ps3cpu.title")) {
         HorizontalOptions(
@@ -2338,7 +2339,7 @@ private fun MenuCycleRow(
 }
 
 @Composable
-private fun CompactAction(title: String, glyph: String, modifier: Modifier, onClick: () -> Unit) {
+internal fun CompactAction(title: String, glyph: String, modifier: Modifier, onClick: () -> Unit) {
     com.armsx2.ui.xmb.LocalXmbCollector.current?.let { c ->
         com.armsx2.ui.xmb.XmbCollected(c, com.armsx2.ui.xmb.XmbNode.Action("p${androidx.compose.runtime.currentCompositeKeyHash}", title, c.icon) { onClick() })
         return
